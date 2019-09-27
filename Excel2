@@ -1,0 +1,930 @@
+package com.company.project.core.util;
+
+import com.company.project.core.annotation.ExportConfig;
+import com.company.project.core.handler.ExportHandler;
+import com.company.project.core.util.poi.convert.ExportConvert;
+import com.company.project.core.util.poi.pojo.ExcelSet;
+import com.company.project.core.util.poi.pojo.ExcelSheet;
+import com.company.project.core.util.poi.pojo.ExportItem;
+import com.csvreader.CsvWriter;
+import com.google.common.collect.Maps;
+import org.apache.commons.beanutils.BeanUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.poi.EncryptedDocumentException;
+import org.apache.poi.hssf.usermodel.HSSFWorkbook;
+import org.apache.poi.hssf.util.HSSFColor;
+import org.apache.poi.openxml4j.exceptions.InvalidFormatException;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.streaming.SXSSFCell;
+import org.apache.poi.xssf.streaming.SXSSFRow;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+import org.apache.poi.xssf.usermodel.XSSFCellStyle;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.servlet.http.HttpServletResponse;
+import java.io.*;
+import java.lang.reflect.Field;
+import java.nio.charset.Charset;
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+public class ExcelUtils {
+
+    private Logger log = LoggerFactory.getLogger(this.getClass());
+
+    private Class<?> mClass = null;
+    private HttpServletResponse mResponse = null;
+    // 分Sheet机制：每个Sheet最多多少条数据
+    private Integer mMaxSheetRecords = 10000;
+    // 缓存数据格式器实例,避免多次使用反射进行实例化
+    private Map<String, ExportConvert> mConvertInstanceCache = new HashMap<>();
+
+    protected ExcelUtils() {
+    }
+
+    private ExcelUtils(Class<?> clazz) {
+        this(clazz, null);
+    }
+
+    private ExcelUtils(Class<?> clazz, HttpServletResponse response) {
+        this.mResponse = response;
+        this.mClass = clazz;
+    }
+
+    /**
+     * 用于生成本地文件
+     *
+     * @param clazz 实体Class对象
+     * @return ExcelUtils
+     */
+    static ExcelUtils builder(Class<?> clazz) {
+        return new ExcelUtils(clazz);
+    }
+
+    /**
+     * 用于浏览器导出
+     *
+     * @param clazz    实体Class对象
+     * @param response 原生HttpServletResponse对象
+     * @return ExcelUtils
+     */
+    public static ExcelUtils export(Class<?> clazz, HttpServletResponse response) {
+        return new ExcelUtils(clazz, response);
+    }
+
+    /**
+     * 分Sheet机制：每个Sheet最多多少条数据(默认10000)
+     *
+     * @param size 数据条数
+     * @return this
+     */
+    public ExcelUtils setMaxSheetRecords(Integer size) {
+        this.mMaxSheetRecords = size;
+        return this;
+    }
+
+    /**
+     * 导出Excel(此方式需依赖浏览器实现文件下载,故应先使用export()构造器)
+     *
+     * @param data      数据集合
+     * @param sheetName 工作表名字
+     * @return true-操作成功,false-操作失败
+     */
+    public boolean toExcel(List<?> data, String sheetName) {
+        requiredexportParams();
+
+        try {
+            return toExcel(data, sheetName, mResponse.getOutputStream());
+        } catch (IOException e) {
+            log.error(e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * 针对转换方法的默认实现(提供默认样式和文件命名规则)
+     *
+     * @param data      数据集合
+     * @param sheetName 工作表名字
+     * @param out       输出流
+     * @return true-操作成功,false-操作失败
+     */
+    boolean toExcel(List<?> data, String sheetName, OutputStream out) {
+
+        return toExcel(data, sheetName, new ExportHandler() {
+
+            @Override
+            public CellStyle headCellStyle(SXSSFWorkbook wb) {
+                CellStyle cellStyle = wb.createCellStyle();
+                Font font = wb.createFont();
+                cellStyle.setFillForegroundColor((short) 12);
+                cellStyle.setFillPattern(CellStyle.SOLID_FOREGROUND);// 填充模式
+                cellStyle.setBorderTop(CellStyle.BORDER_THIN);// 上边框为细边框
+                cellStyle.setBorderRight(CellStyle.BORDER_THIN);// 右边框为细边框
+                cellStyle.setBorderBottom(CellStyle.BORDER_THIN);// 下边框为细边框
+                cellStyle.setBorderLeft(CellStyle.BORDER_THIN);// 左边框为细边框
+                cellStyle.setAlignment(CellStyle.ALIGN_LEFT);// 对齐
+                cellStyle.setFillForegroundColor(HSSFColor.GREEN.index);
+                cellStyle.setFillBackgroundColor(HSSFColor.GREEN.index);
+                font.setBoldweight(Font.BOLDWEIGHT_NORMAL);
+                // font.setFontHeightInPoints((short) 12);// 字体大小
+                font.setColor(HSSFColor.WHITE.index);
+                // 应用标题字体到标题样式
+                cellStyle.setFont(font);
+                return cellStyle;
+            }
+
+            @Override
+            public String exportFileName(String sheetName) {
+                return String.format("导出-%s-%s", sheetName, System.currentTimeMillis());
+            }
+        }, out);
+    }
+
+    private boolean toExcel(List<?> data, String sheetName, ExportHandler handler, OutputStream out) {
+        requiredbuilderParams();
+        if (data == null || data.isEmpty()) {
+            return false;
+        }
+        // 导出列查询。
+        ExportConfig currentExportConfig;
+        ExportItem currentExportItem;
+        List<ExportItem> exportItems = new ArrayList<>();
+        for (Field field : mClass.getDeclaredFields()) {
+
+            currentExportConfig = field.getAnnotation(ExportConfig.class);
+            if (currentExportConfig != null) {
+                currentExportItem = new ExportItem().setField(field.getName())
+                        .setDisplay("field".equals(currentExportConfig.value()) ? field.getName()
+                                : currentExportConfig.value())
+                        .setWidth(currentExportConfig.width()).setConvert(currentExportConfig.convert())
+                        .setColor(currentExportConfig.color()).setReplace(currentExportConfig.replace());
+                exportItems.add(currentExportItem);
+            }
+
+        }
+
+        // 创建新的工作薄。
+        SXSSFWorkbook wb = POIUtils.newSXSSFWorkbook();
+
+        double sheetNo = Math.ceil((double) data.size() / mMaxSheetRecords);// 取出一共有多少个sheet.
+
+        // =====多sheet生成填充数据=====
+        int index = 0;
+        while (index <= (sheetNo == 0.0 ? sheetNo : sheetNo - 1)) {
+            SXSSFSheet sheet = POIUtils.newSXSSFSheet(wb, sheetName + (index == 0 ? "" : "_" + index));
+
+            // 创建表头
+            SXSSFRow headerRow = POIUtils.newSXSSFRow(sheet, 0);
+            for (int i = 0; i < exportItems.size(); i++) {
+                SXSSFCell cell = POIUtils.newSXSSFCell(headerRow, i);
+                POIUtils.setColumnWidth(sheet, i, exportItems.get(i).getWidth(), exportItems.get(i).getDisplay());
+                cell.setCellValue(exportItems.get(i).getDisplay());
+
+                CellStyle style = handler.headCellStyle(wb);
+                if (style != null) {
+                    cell.setCellStyle(style);
+                }
+            }
+
+            SXSSFRow bodyRow;
+            String cellValue;
+            SXSSFCell cell;
+            CellStyle style = wb.createCellStyle();
+            Font font = wb.createFont();
+            style.setFont(font);
+
+            // 产生数据行
+            if (!data.isEmpty()) {
+                int startNo = index * mMaxSheetRecords;
+                int endNo = Math.min(startNo + mMaxSheetRecords, data.size());
+
+                int i = startNo;
+                while (i < endNo) {
+                    bodyRow = POIUtils.newSXSSFRow(sheet, i + 1 - startNo);
+                    for (int j = 0; j < exportItems.size(); j++) {
+                        // 处理单元格值
+                        cellValue = exportItems.get(j).getReplace();
+                        if ("".equals(cellValue)) {
+                            try {
+                                cellValue = BeanUtils.getProperty(data.get(i), exportItems.get(j).getField());
+                            } catch (Exception e) {
+                                log.error(e.getMessage());
+                            }
+                        }
+
+                        // 格式化单元格值
+                        if (!"".equals(exportItems.get(j).getConvert())) {
+                            cellValue = convertCellValue(cellValue, exportItems.get(j).getConvert());
+                        }
+
+                        // 单元格宽度
+                        POIUtils.setColumnWidth(sheet, j, exportItems.get(j).getWidth(), cellValue);
+
+                        cell = POIUtils.newSXSSFCell(bodyRow, j);
+                        // fix: 当值为“”时,当前index的cell会失效
+                        cell.setCellValue("".equals(cellValue) ? null : cellValue);
+                        cell.setCellStyle(style);
+                    }
+                    i++;
+                }
+            }
+            index++;
+        }
+
+        try {
+            // 生成Excel文件并下载.(通过response对象是否为空来判定是使用浏览器下载还是直接写入到output中)
+            POIUtils.writeByLocalOrBrowser(mResponse, handler.exportFileName(sheetName), wb, out);
+        } catch (Exception e) {
+            log.error(e.getMessage());
+            return false;
+        }
+
+        return true;
+    }
+
+    boolean toCsv(List<?> data, String path) {
+        try {
+            requiredbuilderParams();
+            if (data == null || data.isEmpty()) {
+                return false;
+            }
+
+            // 导出列查询。
+            ExportConfig currentExportConfig;
+            ExportItem currentExportItem;
+            List<ExportItem> exportItems = new ArrayList<>();
+            for (Field field : mClass.getDeclaredFields()) {
+
+                currentExportConfig = field.getAnnotation(ExportConfig.class);
+                if (currentExportConfig != null) {
+                    currentExportItem = new ExportItem().setField(field.getName())
+                            .setDisplay("field".equals(currentExportConfig.value()) ? field.getName()
+                                    : currentExportConfig.value())
+                            .setConvert(currentExportConfig.convert()).setReplace(currentExportConfig.replace());
+                    exportItems.add(currentExportItem);
+                }
+
+            }
+
+            String cellValue;
+            FileOutputStream out = new FileOutputStream(path);
+            // 解决乱码
+            out.write(new byte[]{(byte) 0xEF, (byte) 0xBB, (byte) 0xBF});
+            CsvWriter csvWriter = new CsvWriter(out, ',', Charset.forName("UTF-8"));
+            String[] csvHeadersArr = exportItems.stream().map(ExportItem::getDisplay).toArray(String[]::new);
+            csvWriter.writeRecord(csvHeadersArr);
+            for (Object aData : data) {
+                List<Object> csvContent = new ArrayList<>();
+                for (ExportItem exportItem : exportItems) {
+                    // 处理单元格值
+                    cellValue = exportItem.getReplace();
+                    if (!StringUtils.isNotBlank(cellValue)) {
+                        cellValue = BeanUtils.getProperty(aData, exportItem.getField());
+                    }
+
+                    // 格式化单元格值
+                    if (StringUtils.isNotBlank(exportItem.getConvert())) {
+                        cellValue = convertCellValue(cellValue, exportItem.getConvert());
+                    }
+                    csvContent.add(cellValue);
+                }
+                String[] csvContentArr = csvContent.toArray(new String[0]);
+                csvWriter.writeRecord(csvContentArr);
+            }
+            csvWriter.close();
+            return true;
+        } catch (Exception e) {
+            log.error(e.getMessage());
+            return false;
+        }
+    }
+
+    // convertCellValue: number to String
+    private String convertCellValue(Object oldValue, String format) {
+        try {
+            String protocol = format.split(":")[0];
+
+            // 键值对字符串解析：s:1=男,2=女
+            if ("s".equalsIgnoreCase(protocol)) {
+
+                String[] pattern = format.split(":")[1].split(",");
+                for (String p : pattern) {
+                    String[] cp = p.split("=");
+                    if (cp[0].equals(oldValue)) {
+                        return cp[1];
+                    }
+                }
+
+            }
+            if ("c".equalsIgnoreCase(protocol)) {
+
+                String clazz = format.split(":")[1];
+                ExportConvert export = mConvertInstanceCache.get(clazz);
+                if (export == null) {
+                    export = (ExportConvert) Class.forName(clazz).newInstance();
+                    mConvertInstanceCache.put(clazz, export);
+                }
+
+                if (mConvertInstanceCache.size() > 10)
+                    mConvertInstanceCache.clear();
+
+                return export.handler(oldValue);
+            }
+        } catch (Exception e) {
+            log.error(e.getMessage());
+        }
+        return String.valueOf(oldValue);
+    }
+
+    private void requiredbuilderParams() {
+        if (mClass == null) {
+            throw new IllegalArgumentException("请先使用com.*.core.util.ExcelUtils.builder(Class<?>)构造器初始化参数。");
+        }
+    }
+
+    private void requiredexportParams() {
+        if (mClass == null || mResponse == null) {
+            throw new IllegalArgumentException(
+                    "请先使用com.*.core.util.ExcelUtils.export(Class<?>, HttpServletResponse)构造器初始化参数。");
+        }
+
+    }
+    // @Value("${file_base_path}")
+    // private static String fileBasePath;//文件的基础路径
+    // private static String fileBasePath = System.getProperty("user.dir") + File.separator + "excel" + File.separator;;//文件的基础路径
+
+    public static final String OFFICE_EXCEL_XLS = "xls";
+    public static final String OFFICE_EXCEL_XLSX = "xlsx";
+
+    /**
+     * 读取指定Sheet也的内容
+     *
+     * @param filepath filepath 文件全路径
+     * @param sheetNo  sheet序号,从0开始,如果读取全文sheetNo设置null
+     */
+    public static String readExcel(String filepath, Integer sheetNo)
+            throws EncryptedDocumentException, InvalidFormatException, IOException {
+        StringBuilder sb = new StringBuilder();
+        Workbook workbook = getWorkbook(filepath);
+        if (workbook != null) {
+            if (sheetNo == null) {
+                int numberOfSheets = workbook.getNumberOfSheets();
+                for (int i = 0; i < numberOfSheets; i++) {
+                    Sheet sheet = workbook.getSheetAt(i);
+                    if (sheet == null) {
+                        continue;
+                    }
+                    sb.append(readExcelSheet(sheet));
+                }
+            } else {
+                Sheet sheet = workbook.getSheetAt(sheetNo);
+                if (sheet != null) {
+                    sb.append(readExcelSheet(sheet));
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 根据文件路径获取Workbook对象
+     *
+     * @param filepath 文件全路径
+     */
+    public static Workbook getWorkbook(String filepath)
+            throws EncryptedDocumentException, InvalidFormatException, IOException {
+        InputStream is = null;
+        Workbook wb = null;
+        if (StringUtils.isBlank(filepath)) {
+            throw new IllegalArgumentException("文件路径不能为空");
+        } else {
+            String suffiex = getSuffiex(filepath);
+            if (StringUtils.isBlank(suffiex)) {
+                throw new IllegalArgumentException("文件后缀不能为空");
+            }
+            if (OFFICE_EXCEL_XLS.equals(suffiex) || OFFICE_EXCEL_XLSX.equals(suffiex)) {
+                try {
+                    is = new FileInputStream(filepath);
+                    wb = WorkbookFactory.create(is);
+                } finally {
+                    if (is != null) {
+                        is.close();
+                    }
+                    if (wb != null) {
+                        wb.close();
+                    }
+                }
+            } else {
+                throw new IllegalArgumentException("该文件非Excel文件");
+            }
+        }
+        return wb;
+    }
+
+    /**
+     * 获取后缀
+     *
+     * @param filepath filepath 文件全路径
+     */
+    private static String getSuffiex(String filepath) {
+        if (StringUtils.isBlank(filepath)) {
+            return "";
+        }
+        int index = filepath.lastIndexOf(".");
+        if (index == -1) {
+            return "";
+        }
+        return filepath.substring(index + 1, filepath.length());
+    }
+
+    private static String readExcelSheet(Sheet sheet) {
+        StringBuilder sb = new StringBuilder();
+
+        if (sheet != null) {
+            int rowNos = sheet.getLastRowNum();// 得到excel的总记录条数
+            for (int i = 0; i <= rowNos; i++) {// 遍历行
+                Row row = sheet.getRow(i);
+                if (row != null) {
+                    int columNos = row.getLastCellNum();// 表头总共的列数
+                    for (int j = 0; j < columNos; j++) {
+                        Cell cell = row.getCell(j);
+                        if (cell != null) {
+                            //cell.setCellType(CellType.STRING);
+                            cell.setCellType(Cell.CELL_TYPE_STRING);
+                            sb.append(cell.getStringCellValue() + " ");
+                            // System.out.print(cell.getStringCellValue() + " ");
+                        }
+                    }
+                    // System.out.println();
+                }
+            }
+        }
+
+        return sb.toString();
+    }
+
+    /**
+     * 读取指定Sheet页的表头
+     *
+     * @param filepath filepath 文件全路径
+     * @param sheetNo  sheet序号,从0开始,必填
+     */
+    public static Row readTitle(String filepath, int sheetNo)
+            throws IOException, EncryptedDocumentException, InvalidFormatException {
+        Row returnRow = null;
+        Workbook workbook = getWorkbook(filepath);
+        if (workbook != null) {
+            Sheet sheet = workbook.getSheetAt(sheetNo);
+            returnRow = readTitle(sheet);
+        }
+        return returnRow;
+    }
+
+    /**
+     * 读取指定Sheet页的表头
+     */
+    public static Row readTitle(Sheet sheet) throws IOException {
+        Row returnRow = null;
+        int totalRow = sheet.getLastRowNum();// 得到excel的总记录条数
+        for (int i = 0; i < totalRow; i++) {// 遍历行
+            Row row = sheet.getRow(i);
+            if (row == null) {
+                continue;
+            }
+            returnRow = sheet.getRow(0);
+            break;
+        }
+        return returnRow;
+    }
+
+    /**
+     * 创建Excel文件
+     *
+     * @param filepath  filepath 文件全路径
+     * @param sheetName 新Sheet页的名字
+     * @param titles    表头
+     * @param values    每行的单元格
+     */
+    public static boolean writeExcel(String filepath, String sheetName, List<String> titles,
+                                     List<Map<String, Object>> values) throws IOException {
+        boolean success = false;
+        OutputStream outputStream = null;
+        if (StringUtils.isBlank(filepath)) {
+            throw new IllegalArgumentException("文件路径不能为空");
+        } else {
+            String suffiex = getSuffiex(filepath);
+            if (StringUtils.isBlank(suffiex)) {
+                throw new IllegalArgumentException("文件后缀不能为空");
+            }
+            Workbook workbook;
+            if ("xls".equals(suffiex.toLowerCase())) {
+                workbook = new HSSFWorkbook();
+            } else {
+                workbook = new XSSFWorkbook();
+            }
+            // 生成一个表格
+            Sheet sheet;
+            if (StringUtils.isBlank(sheetName)) {
+                // name 为空则使用默认值
+                sheet = workbook.createSheet();
+            } else {
+                sheet = workbook.createSheet(sheetName);
+            }
+            // 设置表格默认列宽度为15个字节
+            sheet.setDefaultColumnWidth((short) 15);
+            // 生成样式
+            Map<String, CellStyle> styles = createStyles(workbook);
+            // 创建标题行
+            Row row = sheet.createRow(0);
+            // 存储标题在Excel文件中的序号
+            Map<String, Integer> titleOrder = Maps.newHashMap();
+            for (int i = 0; i < titles.size(); i++) {
+                Cell cell = row.createCell(i);
+                cell.setCellStyle(styles.get("header"));
+                String title = titles.get(i);
+                cell.setCellValue(title);
+                titleOrder.put(title, i);
+            }
+            // 写入正文
+            Iterator<Map<String, Object>> iterator = values.iterator();
+            // 行号
+            int index = 1;
+            while (iterator.hasNext()) {
+                row = sheet.createRow(index);
+                Map<String, Object> value = iterator.next();
+                for (Map.Entry<String, Object> map : value.entrySet()) {
+                    // 获取列名
+                    String title = map.getKey();
+                    // 根据列名获取序号
+                    int i = titleOrder.get(title);
+                    // 在指定序号处创建cell
+                    Cell cell = row.createCell(i);
+                    // 设置cell的样式
+                    if (index % 2 == 1) {
+                        cell.setCellStyle(styles.get("cellA"));
+                    } else {
+                        cell.setCellStyle(styles.get("cellB"));
+                    }
+                    // 获取列的值
+                    Object object = map.getValue();
+                    // 判断object的类型
+                    SimpleDateFormat simpleDateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                    if (object instanceof Double) {
+                        cell.setCellValue((Double) object);
+                    } else if (object instanceof Date) {
+                        String time = simpleDateFormat.format((Date) object);
+                        cell.setCellValue(time);
+                    } else if (object instanceof Calendar) {
+                        Calendar calendar = (Calendar) object;
+                        String time = simpleDateFormat.format(calendar.getTime());
+                        cell.setCellValue(time);
+                    } else if (object instanceof Boolean) {
+                        cell.setCellValue((Boolean) object);
+                    } else {
+                        if (object != null) {
+                            cell.setCellValue(object.toString());
+                        }
+                    }
+                }
+                index++;
+            }
+
+            try {
+                outputStream = new FileOutputStream(filepath);
+                workbook.write(outputStream);
+                success = true;
+            } finally {
+                if (outputStream != null) {
+                    outputStream.close();
+                }
+                if (workbook != null) {
+                    workbook.close();
+                }
+            }
+            return success;
+        }
+    }
+
+    /**
+     * 设置格式
+     */
+    private static Map<String, CellStyle> createStyles(Workbook wb) {
+        Map<String, CellStyle> styles = Maps.newHashMap();
+
+        // 标题样式
+        XSSFCellStyle titleStyle = (XSSFCellStyle) wb.createCellStyle();
+        titleStyle.setAlignment(HorizontalAlignment.CENTER); // 水平对齐
+        titleStyle.setVerticalAlignment(VerticalAlignment.CENTER); // 垂直对齐
+        titleStyle.setLocked(true); // 样式锁定
+        titleStyle.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        Font titleFont = wb.createFont();
+        titleFont.setFontHeightInPoints((short) 16);
+        titleFont.setBold(true);
+        titleFont.setFontName("微软雅黑");
+        titleStyle.setFont(titleFont);
+        styles.put("title", titleStyle);
+
+        // 文件头样式
+        XSSFCellStyle headerStyle = (XSSFCellStyle) wb.createCellStyle();
+        headerStyle.setAlignment(HorizontalAlignment.CENTER);
+        headerStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+        headerStyle.setFillForegroundColor(IndexedColors.LIGHT_BLUE.getIndex()); // 前景色
+        headerStyle.setFillPattern(FillPatternType.SOLID_FOREGROUND); // 颜色填充方式
+        headerStyle.setWrapText(true);
+        headerStyle.setBorderRight(BorderStyle.THIN); // 设置边界
+        headerStyle.setRightBorderColor(IndexedColors.BLACK.getIndex());
+        headerStyle.setBorderLeft(BorderStyle.THIN);
+        headerStyle.setLeftBorderColor(IndexedColors.BLACK.getIndex());
+        headerStyle.setBorderTop(BorderStyle.THIN);
+        headerStyle.setTopBorderColor(IndexedColors.BLACK.getIndex());
+        headerStyle.setBorderBottom(BorderStyle.THIN);
+        headerStyle.setBottomBorderColor(IndexedColors.BLACK.getIndex());
+        Font headerFont = wb.createFont();
+        headerFont.setFontHeightInPoints((short) 12);
+        headerFont.setColor(IndexedColors.WHITE.getIndex());
+        titleFont.setFontName("微软雅黑");
+        headerStyle.setFont(headerFont);
+        styles.put("header", headerStyle);
+
+        Font cellStyleFont = wb.createFont();
+        cellStyleFont.setFontHeightInPoints((short) 12);
+        cellStyleFont.setColor(IndexedColors.BLUE_GREY.getIndex());
+        cellStyleFont.setFontName("微软雅黑");
+
+        // 正文样式A
+        XSSFCellStyle cellStyleA = (XSSFCellStyle) wb.createCellStyle();
+        cellStyleA.setAlignment(HorizontalAlignment.CENTER); // 居中设置
+        cellStyleA.setVerticalAlignment(VerticalAlignment.CENTER);
+        cellStyleA.setWrapText(true);
+        cellStyleA.setBorderRight(BorderStyle.THIN);
+        cellStyleA.setRightBorderColor(IndexedColors.BLACK.getIndex());
+        cellStyleA.setBorderLeft(BorderStyle.THIN);
+        cellStyleA.setLeftBorderColor(IndexedColors.BLACK.getIndex());
+        cellStyleA.setBorderTop(BorderStyle.THIN);
+        cellStyleA.setTopBorderColor(IndexedColors.BLACK.getIndex());
+        cellStyleA.setBorderBottom(BorderStyle.THIN);
+        cellStyleA.setBottomBorderColor(IndexedColors.BLACK.getIndex());
+        cellStyleA.setFont(cellStyleFont);
+        styles.put("cellA", cellStyleA);
+
+        // 正文样式B:添加前景色为浅黄色
+        XSSFCellStyle cellStyleB = (XSSFCellStyle) wb.createCellStyle();
+        cellStyleB.setAlignment(HorizontalAlignment.CENTER);
+        cellStyleB.setVerticalAlignment(VerticalAlignment.CENTER);
+        cellStyleB.setFillForegroundColor(IndexedColors.LIGHT_YELLOW.getIndex());
+        cellStyleB.setFillPattern(FillPatternType.SOLID_FOREGROUND);
+        cellStyleB.setWrapText(true);
+        cellStyleB.setBorderRight(BorderStyle.THIN);
+        cellStyleB.setRightBorderColor(IndexedColors.BLACK.getIndex());
+        cellStyleB.setBorderLeft(BorderStyle.THIN);
+        cellStyleB.setLeftBorderColor(IndexedColors.BLACK.getIndex());
+        cellStyleB.setBorderTop(BorderStyle.THIN);
+        cellStyleB.setTopBorderColor(IndexedColors.BLACK.getIndex());
+        cellStyleB.setBorderBottom(BorderStyle.THIN);
+        cellStyleB.setBottomBorderColor(IndexedColors.BLACK.getIndex());
+        cellStyleB.setFont(cellStyleFont);
+        styles.put("cellB", cellStyleB);
+
+        return styles;
+    }
+
+    /**
+     * 将源文件的内容复制到新Excel文件(可供理解Excel使用,使用价值不大)
+     *
+     * @param srcFilepath 源文件全路径
+     * @param desFilepath 目标文件全路径
+     */
+    public static void writeExcel(String srcFilepath, String desFilepath)
+            throws IOException, EncryptedDocumentException, InvalidFormatException {
+        FileOutputStream outputStream = null;
+        String suffiex = getSuffiex(desFilepath);
+        if (StringUtils.isBlank(suffiex)) {
+            throw new IllegalArgumentException("文件后缀不能为空");
+        }
+        Workbook workbook_des;
+        if ("xls".equals(suffiex.toLowerCase())) {
+            workbook_des = new HSSFWorkbook();
+        } else {
+            workbook_des = new XSSFWorkbook();
+        }
+
+        Workbook workbook = getWorkbook(srcFilepath);
+        if (workbook != null) {
+            int numberOfSheets = workbook.getNumberOfSheets();
+            for (int k = 0; k < numberOfSheets; k++) {
+                Sheet sheet = workbook.getSheetAt(k);
+                Sheet sheet_des = workbook_des.createSheet(sheet.getSheetName());
+                if (sheet != null) {
+                    int rowNos = sheet.getLastRowNum();
+                    for (int i = 0; i <= rowNos; i++) {
+                        Row row = sheet.getRow(i);
+                        Row row_des = sheet_des.createRow(i);
+                        if (row != null) {
+                            int columNos = row.getLastCellNum();
+                            for (int j = 0; j < columNos; j++) {
+                                Cell cell = row.getCell(j);
+                                Cell cell_des = row_des.createCell(j);
+                                if (cell != null) {
+                                    //cell.setCellType(CellType.STRING);
+                                    //cell_des.setCellType(CellType.STRING);
+                                    cell.setCellType(Cell.CELL_TYPE_STRING);
+                                    cell_des.setCellType(Cell.CELL_TYPE_STRING);
+
+                                    cell_des.setCellValue(cell.getStringCellValue());
+                                }
+                            }
+                        }
+                    }
+                }
+
+            }
+        }
+
+        try {
+            outputStream = new FileOutputStream(desFilepath);
+            workbook_des.write(outputStream);
+        } finally {
+            if (outputStream != null) {
+                outputStream.close();
+            }
+            if (workbook != null) {
+                workbook_des.close();
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+
+    }
+
+    /**
+     * 解析Excel表格
+     *
+     * @param path 文件路径
+     * @return
+     * @throws Exception
+     */
+    public static ExcelSet resolveExcel(String path) throws Exception {
+        ExcelSet excelSet = new ExcelSet();
+        //Excel文件
+        Workbook workbook = WorkbookFactory.create(new File(path));
+        try {
+            List<ExcelSheet> sheets = new ArrayList<ExcelSheet>();
+            Iterator<Sheet> its = workbook.sheetIterator();
+            //处理每个sheet
+            while (its.hasNext()) {
+                Sheet sheet = its.next();
+
+                ExcelSheet excelSheet = new ExcelSheet();
+                excelSheet.setName(sheet.getSheetName());
+
+                List<List<String>> content = new ArrayList<List<String>>();
+                Iterator<Row> itr = sheet.rowIterator();
+                //处理该sheet下每一行
+                while (itr.hasNext()) {
+                    Row row = itr.next();
+
+                    List<String> contentsOfRow = new ArrayList<String>();
+                    Iterator<Cell> itc = row.cellIterator();
+                    //处理该行每个cell
+                    while (itc.hasNext()) {
+                        Cell cell = itc.next();
+//                        添加这一行解决数值类型单元格无法正确读取问题
+                        //cell.setCellType(CellType.STRING);
+                        cell.setCellType(Cell.CELL_TYPE_STRING);
+                        contentsOfRow.add(cell.toString());
+
+                    }
+                    content.add(contentsOfRow);
+                }
+                excelSheet.setContent(content);
+                sheets.add(excelSheet);
+            }
+            excelSet.setSheets(sheets);
+            excelSet.setExcelFile(new File(path));
+        } catch (Exception e) {
+            e.printStackTrace();
+            throw new Exception("文件解析错误: " + e.getMessage(), e);
+        } finally {
+            workbook.close();
+        }
+        return excelSet;
+    }
+
+    /**
+     * 获取指定单元格内容
+     *
+     * @param excelSheet
+     * @param row
+     * @param col
+     * @return
+     */
+    public static String getExcelCellValue(ExcelSheet excelSheet, int row, int col) {
+        return excelSheet.getContent().get(row).get(col).trim();
+    }
+
+    /**
+     * 获取指定单元格内容
+     *
+     * @param excelSet
+     * @param sheetIndex
+     * @param row
+     * @param col
+     * @return
+     */
+    public static String getExcelCellValue(ExcelSet excelSet, int sheetIndex, int row, int col) {
+        return excelSet.getSheets().get(sheetIndex).getContent().get(row).get(col).trim();
+    }
+
+
+    /**
+     * 些内容到指定工作表和单元格
+     *
+     * @param content
+     * @param excelSet
+     * @param sheetIndex
+     * @param rowIndex
+     * @param colIndex
+     * @throws Exception
+     */
+    public static void writeCellToExcelFile(String content, ExcelSet excelSet, int sheetIndex, int rowIndex, int colIndex) throws Exception {
+
+        String filename = excelSet.getExcelFile().getAbsolutePath();
+
+        Workbook workbook = WorkbookFactory.create(new FileInputStream(filename));
+        Sheet sheet = workbook.getSheetAt(sheetIndex);
+        Row row = sheet.getRow(rowIndex);
+        Cell cell = row.getCell(colIndex);
+        cell.setCellValue(content);
+
+
+        FileOutputStream fo = new FileOutputStream(filename);
+        try {
+            workbook.write(fo);
+        } finally {
+            fo.flush();
+            fo.close();
+        }
+
+    }
+
+    /**
+     * 将ExcelSet对象存入文件
+     *
+     * @param excelSet
+     * @throws Exception
+     */
+    public static void saveExcelSetToFile(ExcelSet excelSet) throws Exception {
+
+        String filename = excelSet.getExcelFile().getAbsolutePath();
+        Workbook workbook = WorkbookFactory.create(new FileInputStream(filename));
+
+        List<ExcelSheet> sheets = excelSet.getSheets();
+
+        FileOutputStream fo = new FileOutputStream(filename);
+
+        try {
+//         每个工作表
+            for (int sheetIndex = 0; sheetIndex < sheets.size(); sheetIndex++) {
+                Sheet toSheet = workbook.getSheetAt(sheetIndex);
+                ExcelSheet sheet = sheets.get(sheetIndex);
+
+                List<List<String>> content = sheet.getContent();
+//            每个工作表的每一行
+                for (int rowIndex = 0; rowIndex < content.size(); rowIndex++) {
+                    Row toRow = toSheet.getRow(rowIndex);
+                    List<String> row = content.get(rowIndex);
+
+                    int colIndex = 0;
+//                每一行的单元格
+                    for (int toColIndex = 0; toColIndex < row.size(); toColIndex++) {
+                        Cell toCell = toRow.getCell(toColIndex);
+                        String cellValue = row.get(colIndex);
+
+
+                        if (toCell != null) {
+                            //if (toCell.getCellTypeEnum().equals(CellType.NUMERIC)) {
+                            if (toCell.getCellType() == Cell.CELL_TYPE_NUMERIC) {
+                                toCell.setCellValue(Double.parseDouble(cellValue));
+                            } else {
+                                toCell.setCellValue(cellValue);
+                            }
+
+                            colIndex++;
+                        }
+                    }
+
+                }
+            }
+            workbook.write(fo);
+        } finally {
+            fo.flush();
+            fo.close();
+        }
+    }
+
+}
